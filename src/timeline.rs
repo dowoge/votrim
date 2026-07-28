@@ -171,15 +171,14 @@ impl Timeline {
         if response.drag_started()
             && let Some(p) = response.interact_pointer_pos()
         {
-            self.drag = self.begin_drag(
+            self.drag = Some(self.begin_drag(
                 p,
                 rect,
-                scrub_rect,
                 seg_rect,
                 overview_rect,
                 segments,
                 modifiers,
-            );
+            ));
             if let Some(Drag::SegStart(i) | Drag::SegEnd(i) | Drag::SegBody { idx: i, .. }) =
                 self.drag
             {
@@ -246,15 +245,15 @@ impl Timeline {
                 *selected = segments.iter().position(|&(a, b)| {
                     p.x >= self.x_of(a, rect) - HANDLE_PX && p.x <= self.x_of(b, rect) + HANDLE_PX
                 });
-            } else if scrub_rect.contains(p) {
+            } else if !overview_rect.contains(p) {
                 out.seek = Some(snap(self.t_of(p.x, rect)));
                 out.seek_exact = true;
             }
         }
 
         if let Some(p) = response.hover_pos()
-            && (scrub_rect.contains(p)
-                || (seg_rect.contains(p) && self.edge_at(segments, p.x, rect).is_some()))
+            && !overview_rect.contains(p)
+            && (!seg_rect.contains(p) || self.edge_at(segments, p.x, rect).is_some())
         {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         }
@@ -286,37 +285,36 @@ impl Timeline {
         None
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn begin_drag(
         &self,
         p: Pos2,
         rect: Rect,
-        scrub_rect: Rect,
         seg_rect: Rect,
         overview_rect: Rect,
         segments: &[(f64, f64)],
         modifiers: egui::Modifiers,
-    ) -> Option<Drag> {
+    ) -> Drag {
         if overview_rect.contains(p) {
-            return Some(Drag::Overview);
+            return Drag::Overview;
         }
         if modifiers.shift {
-            return Some(Drag::Pan {
+            return Drag::Pan {
                 grab_time: self.t_of(p.x, rect),
-            });
+            };
         }
         if seg_rect.contains(p) {
             if let Some(drag) = self.edge_at(segments, p.x, rect) {
-                return Some(drag);
+                return drag;
             }
             let time = self.t_of(p.x, rect);
-            let idx = segments.iter().position(|&(a, b)| time >= a && time <= b)?;
-            return Some(Drag::SegBody {
-                idx,
-                grab: time - segments[idx].0,
-            });
+            if let Some(idx) = segments.iter().position(|&(a, b)| time >= a && time <= b) {
+                return Drag::SegBody {
+                    idx,
+                    grab: time - segments[idx].0,
+                };
+            }
         }
-        scrub_rect.contains(p).then_some(Drag::Playhead)
+        Drag::Playhead
     }
 
     #[allow(clippy::too_many_arguments)]
