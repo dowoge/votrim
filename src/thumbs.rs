@@ -1,14 +1,21 @@
 use crate::media::{self, MediaInfo};
 use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
-const WORKERS: usize = 3;
 const MARGIN: i64 = 8;
+
+/// Seeks spend as much time waiting on the file as decoding, so the pool runs
+/// wider than the core count would suggest but stops paying off well before it.
+fn workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).clamp(2, 8))
+        .unwrap_or(3)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
@@ -42,6 +49,28 @@ struct Source {
     h: u32,
 }
 
+/// Whichever worker is free takes the next job, so one slow seek cannot hold up
+/// tiles the others could be decoding. Taken from the back: during a zoom the
+/// tiles just asked for are the ones on screen, and older requests are usually
+/// for a level that has already been left behind.
+#[derive(Default)]
+struct Queue {
+    jobs: Mutex<VecDeque<Job>>,
+    ready: Condvar,
+}
+
+impl Queue {
+    fn take(&self) -> Job {
+        let mut jobs = self.jobs.lock().unwrap();
+        loop {
+            match jobs.pop_back() {
+                Some(job) => return job,
+                None => jobs = self.ready.wait(jobs).unwrap(),
+            }
+        }
+    }
+}
+
 /// Frames of the open clip, drawn as a strip behind the scrub bar. A coarse
 /// level spanning the whole file is extracted once and kept, so zooming always
 /// has something to show while the sharper tiles for that zoom are decoding.
@@ -57,8 +86,7 @@ pub struct Thumbs {
     shared_level: Arc<AtomicI64>,
     generation: Arc<AtomicU64>,
     children: Arc<Mutex<HashMap<u32, Child>>>,
-    senders: Vec<Sender<Job>>,
-    next: usize,
+    queue: Arc<Queue>,
     done: Receiver<(u64, Key, Vec<u8>)>,
 }
 
@@ -67,19 +95,17 @@ impl Thumbs {
         let generation = Arc::new(AtomicU64::new(0));
         let shared_level = Arc::new(AtomicI64::new(0));
         let children: Arc<Mutex<HashMap<u32, Child>>> = Arc::default();
+        let queue: Arc<Queue> = Arc::default();
         let (results, done) = channel();
-        let senders = (0..WORKERS)
-            .map(|_| {
-                let (tx, rx) = channel();
-                let generation = generation.clone();
-                let level = shared_level.clone();
-                let children = children.clone();
-                let results = results.clone();
-                let ctx = ctx.clone();
-                std::thread::spawn(move || work(rx, results, children, generation, level, ctx));
-                tx
-            })
-            .collect();
+        for _ in 0..workers() {
+            let queue = queue.clone();
+            let generation = generation.clone();
+            let level = shared_level.clone();
+            let children = children.clone();
+            let results = results.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || work(queue, results, children, generation, level, ctx));
+        }
         Self {
             enabled: true,
             source: None,
@@ -90,8 +116,7 @@ impl Thumbs {
             shared_level,
             generation,
             children,
-            senders,
-            next: 0,
+            queue,
             done,
         }
     }
@@ -165,6 +190,9 @@ impl Thumbs {
         });
         if level != self.level {
             self.pending.retain(|k| k.level == coarse_level);
+            let mut jobs = self.queue.jobs.lock().unwrap();
+            jobs.retain(|j| j.coarse || j.key.level == level);
+            drop(jobs);
             self.level = level;
             self.shared_level.store(level as i64, Ordering::SeqCst);
         }
@@ -211,8 +239,9 @@ impl Thumbs {
         if !wanted.is_empty() {
             let path = src.path.clone();
             let generation = self.generation.load(Ordering::SeqCst);
+            let mut jobs = self.queue.jobs.lock().unwrap();
             for (key, time, coarse) in wanted {
-                let job = Job {
+                jobs.push_back(Job {
                     generation,
                     key,
                     path: path.clone(),
@@ -220,13 +249,11 @@ impl Thumbs {
                     w,
                     h,
                     coarse,
-                };
-                let sender = &self.senders[self.next % WORKERS];
-                self.next = self.next.wrapping_add(1);
-                if sender.send(job).is_ok() {
-                    self.pending.insert(key);
-                }
+                });
+                self.pending.insert(key);
             }
+            drop(jobs);
+            self.queue.ready.notify_all();
         }
     }
 
@@ -250,14 +277,15 @@ impl Thumbs {
 }
 
 fn work(
-    jobs: Receiver<Job>,
+    queue: Arc<Queue>,
     results: Sender<(u64, Key, Vec<u8>)>,
     children: Arc<Mutex<HashMap<u32, Child>>>,
     generation: Arc<AtomicU64>,
     level: Arc<AtomicI64>,
     ctx: egui::Context,
 ) {
-    while let Ok(job) = jobs.recv() {
+    loop {
+        let job = queue.take();
         if job.generation != generation.load(Ordering::SeqCst)
             || (!job.coarse && i64::from(job.key.level) != level.load(Ordering::SeqCst))
         {
