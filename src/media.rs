@@ -5,6 +5,10 @@ use std::process::{Command, Stdio};
 
 pub const PEAKS_PER_SEC: usize = 200;
 
+/// Thumbnails are decoded at twice the height of the strip they are drawn in so
+/// they stay sharp on a HiDPI display.
+pub const THUMB_H: u32 = 80;
+
 const PEAK_RATE: usize = 16_000;
 
 #[derive(Debug, Clone)]
@@ -30,6 +34,15 @@ impl MediaInfo {
         } else {
             1.0 / 30.0
         }
+    }
+
+    /// Thumbnail dimensions at `THUMB_H`, or `None` when the probe reported no
+    /// usable frame size.
+    pub fn thumb_size(&self) -> Option<(u32, u32)> {
+        (self.width > 0 && self.height > 0).then(|| {
+            let w = (THUMB_H as f64 * self.width as f64 / self.height as f64).round() as u32;
+            (w.max(1), THUMB_H)
+        })
     }
 }
 
@@ -215,6 +228,39 @@ pub fn peaks(path: &Path) -> Result<Vec<(f32, f32)>, String> {
     Ok(out)
 }
 
+/// Decodes one `w`x`h` RGBA frame to stdout. `fast` drops the decode from the
+/// preceding keyframe, which returns almost immediately but lands on whatever
+/// frame that keyframe holds instead of the one at `time`.
+pub fn thumb_cmd(path: &Path, time: f64, w: u32, h: u32, fast: bool) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error"]);
+    if fast {
+        cmd.arg("-noaccurate_seek");
+    }
+    cmd.arg("-ss")
+        .arg(format!("{time:.3}"))
+        .arg("-i")
+        .arg(path)
+        .args(["-frames:v", "1", "-vf"])
+        .arg(format!("scale={w}:{h}"))
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    cmd
+}
+
+/// The single frame written by `thumb_cmd`; a short read means ffmpeg reached
+/// the end of the file without decoding one.
+pub fn read_frame(mut r: impl Read, w: u32, h: u32) -> Result<Vec<u8>, String> {
+    let mut buf = vec![0u8; w as usize * h as usize * 4];
+    let n = fill(&mut r, &mut buf).map_err(|e| format!("ffmpeg: {e}"))?;
+    if n < buf.len() {
+        return Err("no frame decoded".into());
+    }
+    Ok(buf)
+}
+
 pub fn fmt_time(t: f64) -> String {
     let t = t.max(0.0);
     let total_ms = (t * 1000.0).round() as u64;
@@ -276,6 +322,29 @@ mod tests {
         path
     }
 
+    fn video_fixture() -> PathBuf {
+        let path = std::env::temp_dir().join("votrim_thumbs.mp4");
+        if !path.exists() {
+            let status = Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=size=320x180:rate=10:duration=3")
+                .args(["-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-y"])
+                .arg(&path)
+                .status()
+                .expect("ffmpeg");
+            assert!(status.success());
+        }
+        path
+    }
+
+    fn thumb(path: &Path, time: f64, w: u32, h: u32) -> Result<Vec<u8>, String> {
+        let mut child = thumb_cmd(path, time, w, h, false).spawn().expect("ffmpeg");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let frame = read_frame(stdout, w, h);
+        child.wait().expect("ffmpeg");
+        frame
+    }
+
     fn loudest(peaks: &[(f32, f32)]) -> f32 {
         peaks.iter().fold(0.0f32, |m, &(lo, hi)| m.max(-lo).max(hi))
     }
@@ -302,5 +371,23 @@ mod tests {
         // A sine swings both ways: every loud bucket has a negative half.
         let lo = p.iter().fold(0.0f32, |m, &(lo, _)| m.min(lo));
         assert!(lo < -0.99, "{lo}");
+    }
+
+    #[test]
+    fn thumbs_decode_the_frame_at_each_timestamp() {
+        let path = video_fixture();
+        let info = probe(&path).expect("probe");
+        let (w, h) = info.thumb_size().expect("thumb size");
+
+        // 320x180 scaled to THUMB_H keeps the source aspect.
+        assert_eq!((w, h), (142, THUMB_H));
+
+        let head = thumb(&path, 0.2, w, h).expect("head");
+        let tail = thumb(&path, 2.5, w, h).expect("tail");
+        assert_eq!(head.len(), w as usize * h as usize * 4);
+        assert_ne!(head, tail);
+
+        // Past the end nothing is decoded, rather than the last frame again.
+        assert!(thumb(&path, 60.0, w, h).is_err());
     }
 }

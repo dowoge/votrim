@@ -3,7 +3,7 @@ use egui::{
 };
 
 const RULER_H: f32 = 16.0;
-const SCRUB_H: f32 = 40.0;
+pub const SCRUB_H: f32 = 40.0;
 const WAVE_H: f32 = 32.0;
 const SEG_H: f32 = 16.0;
 const OVERVIEW_H: f32 = 12.0;
@@ -57,6 +57,7 @@ pub struct View<'a> {
     pub pending_in: Option<f64>,
     pub peaks: &'a [(f32, f32)],
     pub has_audio: bool,
+    pub thumbs: &'a [crate::thumbs::Tile],
 }
 
 impl Timeline {
@@ -340,6 +341,29 @@ impl Timeline {
         p.rect_filled(seg_rect, 3.0, Color32::from_gray(22));
         p.rect_filled(overview_rect, 3.0, Color32::from_gray(22));
 
+        if !v.thumbs.is_empty() {
+            let strip = ui.painter_at(scrub_rect);
+            for t in v.thumbs {
+                let slot = Rect::from_x_y_ranges(
+                    self.x_of(t.t0, rect)..=self.x_of(t.t1, rect),
+                    scrub_rect.y_range(),
+                );
+                if slot.width() < 0.5
+                    || slot.right() < scrub_rect.left()
+                    || slot.left() > scrub_rect.right()
+                {
+                    continue;
+                }
+                let tint = if t.dim {
+                    Color32::from_gray(110)
+                } else {
+                    Color32::WHITE
+                };
+                let uv = cover_uv(slot.width() / slot.height(), t.aspect);
+                strip.image(t.id, slot, uv, tint);
+            }
+        }
+
         if v.has_audio {
             p.rect_filled(wave_rect, 3.0, Color32::from_gray(18));
             let mid = wave_rect.center().y;
@@ -518,6 +542,17 @@ pub fn nearest(sorted: &[f64], t: f64) -> f64 {
 pub fn keyframe_before(sorted: &[f64], t: f64) -> Option<f64> {
     let i = sorted.partition_point(|&k| k <= t + 1e-6);
     (i > 0).then(|| sorted[i - 1])
+}
+
+/// Centre-crops a frame so it keeps the clip's aspect instead of stretching to
+/// whatever width the zoom level gives its tile.
+fn cover_uv(slot: f32, src: f32) -> Rect {
+    let size = if slot < src {
+        Vec2::new(slot / src, 1.0)
+    } else {
+        Vec2::new(1.0, src / slot)
+    };
+    Rect::from_center_size(Pos2::new(0.5, 0.5), size)
 }
 
 fn tick_label(t: f64, step: f64) -> String {

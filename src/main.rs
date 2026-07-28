@@ -2,6 +2,8 @@ mod encode;
 mod media;
 mod player;
 mod presets;
+mod settings;
+mod thumbs;
 mod timeline;
 
 use eframe::egui::{self, Color32, RichText};
@@ -9,9 +11,11 @@ use encode::{Job, JobSpec, Msg, TrimMode};
 use media::{MediaInfo, fmt_short, fmt_size, fmt_time};
 use player::Player;
 use presets::{AudioCodec, Preset, RateMode, VideoCodec, X_SPEEDS};
+use settings::Settings;
 use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
+use thumbs::Thumbs;
 use timeline::{Timeline, View};
 
 fn main() -> eframe::Result<()> {
@@ -42,6 +46,7 @@ struct App {
     media: Option<MediaInfo>,
     keyframes: Arc<Mutex<Vec<f64>>>,
     waveform: Arc<Mutex<Vec<(f32, f32)>>>,
+    thumbs: Thumbs,
 
     segments: Vec<(f64, f64)>,
     selected: Option<usize>,
@@ -52,6 +57,7 @@ struct App {
     speed: f64,
     show_keyframes: bool,
     snap_keyframes: bool,
+    settings: Settings,
 
     mode: TrimMode,
     presets: Vec<Preset>,
@@ -77,7 +83,7 @@ struct App {
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         let presets = presets::load();
         let preset = presets[0].clone();
         Self {
@@ -86,6 +92,7 @@ impl App {
             media: None,
             keyframes: Arc::new(Mutex::new(Vec::new())),
             waveform: Arc::new(Mutex::new(Vec::new())),
+            thumbs: Thumbs::new(cc.egui_ctx.clone()),
             segments: Vec::new(),
             selected: None,
             pending_in: None,
@@ -95,6 +102,7 @@ impl App {
             speed: 1.0,
             show_keyframes: false,
             snap_keyframes: false,
+            settings: settings::load(),
             mode: TrimMode::Reencode,
             presets,
             preset_idx: 0,
@@ -148,6 +156,7 @@ impl App {
                 self.output = default_output(&path, &self.preset.container);
                 self.keyframes.lock().unwrap().clear();
                 self.waveform.lock().unwrap().clear();
+                self.thumbs.open(&info);
 
                 let store = self.keyframes.clone();
                 let probe_path = path.clone();
@@ -591,6 +600,14 @@ impl App {
             ui.checkbox(&mut self.show_keyframes, "keyframes");
             ui.checkbox(&mut self.snap_keyframes, "snap")
                 .on_hover_text("Snap edits to keyframes instead of frames");
+            if ui
+                .checkbox(&mut self.settings.thumbnails, "thumbs")
+                .on_hover_text("Draw video frames in the scrub strip")
+                .changed()
+                && let Err(e) = settings::save(&self.settings)
+            {
+                self.status = format!("Settings not saved: {e}");
+            }
             if ui.button("Fit").on_hover_text("Zoom to fit (F)").clicked() {
                 self.timeline.zoom_to_fit(dur);
             }
@@ -618,6 +635,13 @@ impl App {
         });
 
         ui.add_space(2.0);
+        self.thumbs.set_enabled(self.settings.thumbnails);
+        self.thumbs.prepare(
+            ui.ctx(),
+            self.timeline.view_start,
+            self.timeline.view_dur,
+            ui.available_width(),
+        );
         let keyframes = self.keyframes.lock().unwrap().clone();
         let peaks = self.waveform.lock().unwrap();
         let view = View {
@@ -630,6 +654,7 @@ impl App {
             pending_in: self.pending_in,
             peaks: &peaks,
             has_audio: self.media.as_ref().is_some_and(|m| m.has_audio()),
+            thumbs: self.thumbs.tiles(),
         };
         let mut segments = std::mem::take(&mut self.segments);
         let mut selected = self.selected;
