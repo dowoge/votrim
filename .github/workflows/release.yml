@@ -98,10 +98,12 @@ jobs:
             -e "s/^sha256sums=.*/sha256sums=('$SHA256')/" \
             PKGBUILD
 
-          # makepkg aborts under EUID 0 and container jobs run as root
+          # makepkg aborts under EUID 0 and container jobs run as root. The
+          # PKGBUILD is copied out rather than chowned, or git would then refuse
+          # the clone as dubiously owned.
           useradd -m builder
-          chown -R builder .
-          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+          install -o builder -m 644 PKGBUILD /home/builder/PKGBUILD
+          sudo -u builder sh -c 'cd /home/builder && makepkg --printsrcinfo' > .SRCINFO
 
           if git diff --quiet; then
             echo "AUR package already matches $ver"
