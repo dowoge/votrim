@@ -4,6 +4,7 @@ use egui::{
 
 const RULER_H: f32 = 16.0;
 const SCRUB_H: f32 = 40.0;
+const WAVE_H: f32 = 32.0;
 const SEG_H: f32 = 16.0;
 const OVERVIEW_H: f32 = 12.0;
 const GAP: f32 = 3.0;
@@ -54,6 +55,8 @@ pub struct View<'a> {
     pub show_keyframes: bool,
     pub snap_keyframes: bool,
     pub pending_in: Option<f64>,
+    pub peaks: &'a [(f32, f32)],
+    pub has_audio: bool,
 }
 
 impl Timeline {
@@ -107,7 +110,8 @@ impl Timeline {
         selected: &mut Option<usize>,
     ) -> Output {
         let mut out = Output::default();
-        let height = RULER_H + SCRUB_H + SEG_H + OVERVIEW_H + GAP * 3.0;
+        let wave_h = if v.has_audio { WAVE_H + GAP } else { 0.0 };
+        let height = RULER_H + SCRUB_H + wave_h + SEG_H + OVERVIEW_H + GAP * 3.0;
         let (rect, response) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), height),
             Sense::click_and_drag(),
@@ -124,8 +128,12 @@ impl Timeline {
             Pos2::new(rect.left(), ruler_rect.bottom() + GAP),
             Vec2::new(rect.width(), SCRUB_H),
         );
-        let seg_rect = Rect::from_min_size(
+        let wave_rect = Rect::from_min_size(
             Pos2::new(rect.left(), scrub_rect.bottom() + GAP),
+            Vec2::new(rect.width(), WAVE_H),
+        );
+        let seg_rect = Rect::from_min_size(
+            Pos2::new(rect.left(), scrub_rect.bottom() + wave_h + GAP),
             Vec2::new(rect.width(), SEG_H),
         );
         let overview_rect = Rect::from_min_size(
@@ -255,6 +263,7 @@ impl Timeline {
             rect,
             ruler_rect,
             scrub_rect,
+            wave_rect,
             seg_rect,
             overview_rect,
             v,
@@ -316,6 +325,7 @@ impl Timeline {
         rect: Rect,
         ruler_rect: Rect,
         scrub_rect: Rect,
+        wave_rect: Rect,
         seg_rect: Rect,
         overview_rect: Rect,
         v: &View<'_>,
@@ -329,6 +339,32 @@ impl Timeline {
         p.rect_filled(scrub_rect, 3.0, Color32::from_gray(28));
         p.rect_filled(seg_rect, 3.0, Color32::from_gray(22));
         p.rect_filled(overview_rect, 3.0, Color32::from_gray(22));
+
+        if v.has_audio {
+            p.rect_filled(wave_rect, 3.0, Color32::from_gray(18));
+            let mid = wave_rect.center().y;
+            p.hline(
+                wave_rect.x_range(),
+                mid,
+                Stroke::new(1.0, Color32::from_gray(45)),
+            );
+            let half = wave_rect.height() / 2.0 - 2.0;
+            let stroke = Stroke::new(1.0, Color32::from_rgb(85, 125, 160));
+            let rate = crate::media::PEAKS_PER_SEC as f64;
+            let mut x = wave_rect.left();
+            while x <= wave_rect.right() {
+                let i0 = (self.t_of(x, rect) * rate).floor().max(0.0) as usize;
+                let i1 =
+                    ((self.t_of(x + 1.0, rect) * rate).ceil().max(0.0) as usize).min(v.peaks.len());
+                if i0 < i1 {
+                    let (lo, hi) = v.peaks[i0..i1]
+                        .iter()
+                        .fold((0.0f32, 0.0f32), |(l, h), &(a, b)| (l.min(a), h.max(b)));
+                    p.vline(x, mid - hi * half..=mid - lo * half, stroke);
+                }
+                x += 1.0;
+            }
+        }
 
         let px_per_sec = rect.width() as f64 / self.view_dur;
         let step = *NICE_STEPS
@@ -424,9 +460,14 @@ impl Timeline {
 
         let px = self.x_of(v.position, rect);
         if px >= rect.left() - 1.0 && px <= rect.right() + 1.0 {
+            let bottom = if v.has_audio {
+                wave_rect.bottom()
+            } else {
+                scrub_rect.bottom()
+            };
             p.vline(
                 px,
-                scrub_rect.y_range(),
+                scrub_rect.top()..=bottom,
                 Stroke::new(1.5, Color32::from_rgb(240, 70, 70)),
             );
             p.rect_filled(

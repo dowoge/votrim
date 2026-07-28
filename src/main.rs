@@ -41,6 +41,7 @@ struct App {
     player_err: Option<String>,
     media: Option<MediaInfo>,
     keyframes: Arc<Mutex<Vec<f64>>>,
+    waveform: Arc<Mutex<Vec<(f32, f32)>>>,
 
     segments: Vec<(f64, f64)>,
     selected: Option<usize>,
@@ -84,6 +85,7 @@ impl App {
             player_err: None,
             media: None,
             keyframes: Arc::new(Mutex::new(Vec::new())),
+            waveform: Arc::new(Mutex::new(Vec::new())),
             segments: Vec::new(),
             selected: None,
             pending_in: None,
@@ -145,16 +147,29 @@ impl App {
                 self.position = 0.0;
                 self.output = default_output(&path, &self.preset.container);
                 self.keyframes.lock().unwrap().clear();
+                self.waveform.lock().unwrap().clear();
 
                 let store = self.keyframes.clone();
                 let probe_path = path.clone();
-                let ctx = ctx.clone();
+                let probe_ctx = ctx.clone();
                 std::thread::spawn(move || {
                     if let Ok(k) = media::keyframes(&probe_path) {
                         *store.lock().unwrap() = k;
                     }
-                    ctx.request_repaint();
+                    probe_ctx.request_repaint();
                 });
+
+                if info.has_audio() {
+                    let store = self.waveform.clone();
+                    let peak_path = path.clone();
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(p) = media::peaks(&peak_path) {
+                            *store.lock().unwrap() = p;
+                        }
+                        ctx.request_repaint();
+                    });
+                }
 
                 if let Some(p) = &mut self.player {
                     p.load(&path);
@@ -604,6 +619,7 @@ impl App {
 
         ui.add_space(2.0);
         let keyframes = self.keyframes.lock().unwrap().clone();
+        let peaks = self.waveform.lock().unwrap();
         let view = View {
             duration: dur,
             position: self.position,
@@ -612,10 +628,13 @@ impl App {
             show_keyframes: self.show_keyframes || self.mode == TrimMode::Copy,
             snap_keyframes: self.snap_keyframes,
             pending_in: self.pending_in,
+            peaks: &peaks,
+            has_audio: self.media.as_ref().is_some_and(|m| m.has_audio()),
         };
         let mut segments = std::mem::take(&mut self.segments);
         let mut selected = self.selected;
         let out = self.timeline.show(ui, &view, &mut segments, &mut selected);
+        drop(peaks);
         self.segments = segments;
         self.selected = selected;
         if let Some(t) = out.seek {

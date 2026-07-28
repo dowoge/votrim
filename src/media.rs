@@ -1,6 +1,11 @@
 use serde::Deserialize;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+pub const PEAKS_PER_SEC: usize = 200;
+
+const PEAK_RATE: usize = 16_000;
 
 #[derive(Debug, Clone)]
 pub struct MediaInfo {
@@ -140,6 +145,76 @@ pub fn keyframes(path: &Path) -> Result<Vec<f64>, String> {
     Ok(times)
 }
 
+fn fill(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+/// Min/max sample pairs, `PEAKS_PER_SEC` of them per second, reduced as ffmpeg
+/// streams so the raw audio of a long file is never held whole. Amplitudes are
+/// scaled to the loudest peak, otherwise a quiet clip draws as a flat line.
+pub fn peaks(path: &Path) -> Result<Vec<(f32, f32)>, String> {
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar"])
+        .arg(PEAK_RATE.to_string())
+        .args(["-f", "f32le", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let err_thread = std::thread::spawn(move || {
+        let mut collected = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut collected);
+        collected
+    });
+
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut buf = vec![0u8; PEAK_RATE / PEAKS_PER_SEC * 4];
+    let mut out = Vec::new();
+    loop {
+        let n = fill(&mut stdout, &mut buf).map_err(|e| format!("ffmpeg: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let (mut lo, mut hi) = (0.0f32, 0.0f32);
+        for s in buf[..n].chunks_exact(4) {
+            let v = f32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        out.push((lo, hi));
+        if n < buf.len() {
+            break;
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("ffmpeg: {e}"))?;
+    let err = err_thread.join().unwrap_or_default();
+    if !status.success() {
+        return Err(err.trim().to_string());
+    }
+
+    let loudest = out.iter().fold(0.0f32, |m, &(lo, hi)| m.max(-lo).max(hi));
+    if loudest > 0.0 {
+        for (lo, hi) in &mut out {
+            *lo /= loudest;
+            *hi /= loudest;
+        }
+    }
+    Ok(out)
+}
+
 pub fn fmt_time(t: f64) -> String {
     let t = t.max(0.0);
     let total_ms = (t * 1000.0).round() as u64;
@@ -180,4 +255,52 @@ pub fn fmt_size(bytes: u64) -> String {
         i += 1;
     }
     format!("{v:.1} {}", UNITS[i])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> PathBuf {
+        let path = std::env::temp_dir().join("votrim_peaks.wav");
+        if !path.exists() {
+            let status = Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=3")
+                .args(["-af", "volume=t/3:eval=frame", "-y"])
+                .arg(&path)
+                .status()
+                .expect("ffmpeg");
+            assert!(status.success());
+        }
+        path
+    }
+
+    fn loudest(peaks: &[(f32, f32)]) -> f32 {
+        peaks.iter().fold(0.0f32, |m, &(lo, hi)| m.max(-lo).max(hi))
+    }
+
+    #[test]
+    fn peaks_track_the_audio_envelope() {
+        let p = peaks(&fixture()).expect("peaks");
+
+        // One bucket per 1/PEAKS_PER_SEC across three seconds.
+        assert!(
+            p.len().abs_diff(3 * PEAKS_PER_SEC) < PEAKS_PER_SEC / 10,
+            "{} buckets",
+            p.len()
+        );
+
+        // Normalised against the loudest peak, so the ramp ends at full scale.
+        assert!((loudest(&p) - 1.0).abs() < 1e-6, "{}", loudest(&p));
+
+        // volume=t/3 ramps up, so the opening is far quieter than the tail.
+        let head = loudest(&p[..PEAKS_PER_SEC / 2]);
+        let tail = loudest(&p[p.len() - PEAKS_PER_SEC / 2..]);
+        assert!(head < tail / 4.0, "head {head}, tail {tail}");
+
+        // A sine swings both ways: every loud bucket has a negative half.
+        let lo = p.iter().fold(0.0f32, |m, &(lo, _)| m.min(lo));
+        assert!(lo < -0.99, "{lo}");
+    }
 }
