@@ -21,7 +21,7 @@ jobs:
           pacman -Syu --noconfirm --needed rust mpv git github-cli
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check tag matches Cargo.toml version
         run: |
