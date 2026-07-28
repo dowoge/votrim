@@ -14,6 +14,8 @@ jobs:
     # Built inside Arch so the binary links against the same libmpv.so.2 and
     # glibc the AUR package will run on.
     container: archlinux:base-devel
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
 
     steps:
       - name: Install build dependencies
@@ -36,6 +38,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package
+        id: package
         run: |
           dir="votrim-${GITHUB_REF_NAME#v}-x86_64"
           mkdir "$dir"
@@ -43,6 +46,7 @@ jobs:
           cp assets/votrim.desktop assets/votrim.svg "$dir/"
           tar czf "$dir.tar.gz" "$dir"
           sha256sum "$dir.tar.gz" | tee "$dir.tar.gz.sha256"
+          echo "sha256=$(cut -d' ' -f1 < "$dir.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         env:
@@ -50,3 +54,57 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" --generate-notes \
             votrim-*.tar.gz votrim-*.tar.gz.sha256
+
+  aur:
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git openssh
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@v5
+
+      - name: Configure SSH
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$AUR_SSH_KEY" > "$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
+          printf '%s\n' 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' \
+            > "$HOME/.ssh/known_hosts"
+
+      - name: Sync PKGBUILD to the AUR
+        env:
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes"
+          ver="${GITHUB_REF_NAME#v}"
+
+          git clone ssh://aur@aur.archlinux.org/votrim-bin.git aur
+          cp packaging/PKGBUILD aur/PKGBUILD
+          cd aur
+          sed -i \
+            -e "s/^pkgver=.*/pkgver=$ver/" \
+            -e "s/^pkgrel=.*/pkgrel=1/" \
+            -e "s/^sha256sums=.*/sha256sums=('$SHA256')/" \
+            PKGBUILD
+
+          # makepkg aborts under EUID 0 and container jobs run as root
+          useradd -m builder
+          chown -R builder .
+          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+
+          if git diff --quiet; then
+            echo "AUR package already matches $ver"
+            exit 0
+          fi
+          git -c user.name='votrim release' -c user.email='t@tommyy.dev' \
+            commit -am "votrim-bin $ver-1"
+          git push
