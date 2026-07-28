@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=votrim
+GenericName=Video Trimmer
+Comment=Trim and encode video with a multi-segment timeline
+Exec=votrim %f
+Icon=votrim
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/ogg;
+StartupWMClass=votrim
