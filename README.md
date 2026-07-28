@@ -3,6 +3,16 @@
 Native video trimmer and encoder: a zoomable multi-segment timeline with a live
 mpv preview, and ffmpeg presets for space-efficient output.
 
+## Install
+
+On Arch Linux, from the AUR:
+
+```sh
+paru -S votrim-bin
+```
+
+Otherwise take the tarball from the [latest release](https://github.com/dowoge/votrim/releases/latest).
+
 ## Requirements
 
 - `ffmpeg` and `ffprobe` on `PATH` (built with `libsvtav1`, `libopus`, `libx264`,
