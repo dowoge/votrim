@@ -1,0 +1,52 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Built inside Arch so the binary links against the same libmpv.so.2 and
+    # glibc the AUR package will run on.
+    container: archlinux:base-devel
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed rust mpv git github-cli
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$tag" != "$crate" ]; then
+            echo "tag $tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          dir="votrim-${GITHUB_REF_NAME#v}-x86_64"
+          mkdir "$dir"
+          cp target/release/votrim README.md LICENSE "$dir/"
+          cp assets/votrim.desktop assets/votrim.svg "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" | tee "$dir.tar.gz.sha256"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes \
+            votrim-*.tar.gz votrim-*.tar.gz.sha256
