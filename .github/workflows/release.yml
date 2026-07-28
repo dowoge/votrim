@@ -84,7 +84,9 @@ jobs:
         env:
           SHA256: ${{ needs.build.outputs.sha256 }}
         run: |
-          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes"
+          # ssh expands ~ from /etc/passwd, not $HOME, so both paths are explicit
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes \
+            -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           ver="${GITHUB_REF_NAME#v}"
 
           git clone ssh://aur@aur.archlinux.org/votrim-bin.git aur
